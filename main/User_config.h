@@ -29,7 +29,7 @@
 #define user_config_h
 /*-------------------VERSION----------------------*/
 #ifndef OMG_VERSION
-#  define OMG_VERSION "version_tag"
+#  define OMG_VERSION "v1.5.1"
 #endif
 
 /*-------------CONFIGURE WIFIMANAGER-------------(only ESP8266 & SONOFF RFBridge)*/
@@ -116,13 +116,13 @@ const byte mac[] = {0xDE, 0xED, 0xBA, 0xFE, 0x54, 0x95}; //W5100 ethernet shield
 
 //#define WM_PWD_FROM_MAC true // enable to set the password from the last 8 digits of the ESP MAC address for enhanced security, enabling this option requires to have access to the MAC address, either through a sticker or with serial monitoring
 #ifndef WifiManager_password
-#  define WifiManager_password "your_password" //this is going to be the WPA2-PSK password for the initial setup access point
+#  define WifiManager_password "nemmegfejteni" //this is going to be the WPA2-PSK password for the initial setup access point
 #endif
 #ifndef WifiManager_ssid
 #  define WifiManager_ssid Gateway_Name //this is the network name of the initial setup access point
 #endif
 #ifndef WifiManager_ConfigPortalTimeOut
-#  define WifiManager_ConfigPortalTimeOut 120
+#  define WifiManager_ConfigPortalTimeOut 500
 #endif
 #ifndef WifiManager_TimeOut
 #  define WifiManager_TimeOut 5
@@ -430,7 +430,7 @@ int lowpowermode = DEFAULT_LOW_POWER_MODE;
 #    ifdef ESP8266
 //#      define LED_SEND_RECEIVE 40
 #    elif ESP32
-//#      define LED_SEND_RECEIVE 40
+//#      define LED_SEND_RECEIVE 25
 #    elif __AVR_ATmega2560__ //arduino mega
 //#      define LED_SEND_RECEIVE 40
 #    else //arduino uno/nano
