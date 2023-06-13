@@ -47,10 +47,13 @@ void ONOFFConfig_fromJson(JsonObject& ONOFFdata) {
     // Erase config from NVS (non-volatile storage)
     preferences.begin(Gateway_Short_Name, false);
     if (preferences.isKey("ONOFFConfig")) {
-      preferences.remove("ONOFFConfig");
+      int result = preferences.remove("ONOFFConfig");
+      Log.notice(F("ONOFF config erase result: %d" CR), result);
       preferences.end();
-      Log.notice(F("ONOFF config erased" CR));
       return; // Erase prevails on save, so skipping save
+    } else {
+      Log.notice(F("ONOFF config not found" CR));
+      preferences.end();
     }
   }
   if (ONOFFdata.containsKey("save") && ONOFFdata["save"].as<bool>()) {
@@ -62,9 +65,9 @@ void ONOFFConfig_fromJson(JsonObject& ONOFFdata) {
     String conf = "";
     serializeJson(jsonBuffer, conf);
     preferences.begin(Gateway_Short_Name, false);
-    preferences.putString("ONOFFConfig", conf);
+    int result = preferences.putString("ONOFFConfig", conf);
     preferences.end();
-    Log.notice(F("ONOFF config saved" CR));
+    Log.notice(F("ONOFF Config_save: %s, result: %d" CR), conf.c_str(), result);
   }
 }
 
@@ -85,6 +88,9 @@ void ONOFFConfig_load() {
     JsonObject jo = jsonBuffer.as<JsonObject>();
     ONOFFConfig_fromJson(jo);
     Log.notice(F("ONOFF config loaded" CR));
+  } else {
+    preferences.end();
+    Log.notice(F("ONOFF config not found" CR));
   }
 }
 #  else
@@ -94,9 +100,6 @@ void ONOFFConfig_load(){};
 #  endif
 
 void setupONOFF() {
-#  ifdef MAX_CURRENT_ACTUATOR
-  xTaskCreate(overLimitCurrent, "overLimitCurrent", 4000, NULL, 10, NULL);
-#  endif
 #  ifdef MAX_TEMP_ACTUATOR
   xTaskCreate(overLimitTemp, "overLimitTemp", 4000, NULL, 10, NULL);
 #  endif
@@ -248,23 +251,21 @@ void overLimitTemp(void* pvParameters) {
 
 // Check regularly current the relay and switch it OFF if the current is more than MAX_CURRENT_ACTUATOR
 #  ifdef MAX_CURRENT_ACTUATOR
-void overLimitCurrent(void* pvParameters) {
-  for (;;) {
-    static float previousCurrent = 0;
-    float current = getRN8209current();
-    Log.trace(F("RN8209 Current %F" CR), current);
-    // We switch OFF the actuator if the current of the RN8209 is more than MAX_CURRENT_ACTUATOR.
-    if (current > MAX_CURRENT_ACTUATOR && previousCurrent > MAX_CURRENT_ACTUATOR) {
-      if (digitalRead(ACTUATOR_ONOFF_GPIO) == ACTUATOR_ON) { // This could be with the previous condition, but it is better to trigger the digitalRead only if the previous condition is met to avoid the digitalRead
-        Log.error(F("[ActuatorONOFF] OverCurrent detected ( %F > %F ) switching OFF Actuator" CR), current, MAX_CURRENT_ACTUATOR);
-        ActuatorTrigger();
-        CriticalIndicatorON();
-      }
+void overLimitCurrent(float RN8209current) {
+  static float RN8209previousCurrent = 0;
+  Log.trace(F("RN8209 Current %F" CR), RN8209current);
+  // We switch OFF the actuator if the current of the RN8209 is more than MAX_CURRENT_ACTUATOR.
+  if (RN8209current > MAX_CURRENT_ACTUATOR && RN8209previousCurrent > MAX_CURRENT_ACTUATOR) {
+    if (digitalRead(ACTUATOR_ONOFF_GPIO) == ACTUATOR_ON) { // This could be with the previous condition, but it is better to trigger the digitalRead only if the previous condition is met to avoid the digitalRead
+      Log.error(F("[ActuatorONOFF] OverCurrent detected ( %F > %F ) switching OFF Actuator" CR), RN8209current, MAX_CURRENT_ACTUATOR);
+      ActuatorTrigger();
+      CriticalIndicatorON();
     }
-    previousCurrent = current;
-    vTaskDelay(TimeBetweenReadingCurrent);
   }
+  RN8209previousCurrent = RN8209current;
 }
+#  else
+void overLimitCurrent(float RN8209current) {}
 #  endif
 
 /*
@@ -282,7 +283,7 @@ void ActuatorTrigger() {
     PowerIndicatorOFF();
   }
   // Send the state of the switch to the broker so as to update the status
-  StaticJsonDocument<JSON_MSG_BUFFER> jsonBuffer;
+  StaticJsonDocument<64> jsonBuffer;
   JsonObject ONOFFdata = jsonBuffer.to<JsonObject>();
   ONOFFdata["cmd"] = (int)level;
 #  ifdef ESP32
@@ -297,7 +298,7 @@ void ActuatorTrigger() {
 
 void stateONOFFMeasures() {
   //Publish actuator state
-  StaticJsonDocument<JSON_MSG_BUFFER> jsonBuffer;
+  StaticJsonDocument<64> jsonBuffer;
   JsonObject ONOFFdata = jsonBuffer.to<JsonObject>();
   ONOFFdata["cmd"] = (int)digitalRead(ACTUATOR_ONOFF_GPIO);
   pub(subjectGTWONOFFtoMQTT, ONOFFdata);

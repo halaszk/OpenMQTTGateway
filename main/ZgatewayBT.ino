@@ -59,11 +59,16 @@ BTConfig_s BTConfig;
 
 TheengsDecoder decoder;
 
+static TaskHandle_t xCoreTaskHandle;
+static TaskHandle_t xProcBLETaskHandle;
+
 struct decompose {
   int start;
   int len;
   bool reverse;
 };
+
+unsigned long BLEstarts = 0;
 
 vector<BLEAction> BLEactions;
 
@@ -99,22 +104,24 @@ void BTConfig_init() {
   BTConfig.pubBeaconUuidForTopic = useBeaconUuidForTopic;
   BTConfig.ignoreWBlist = false;
   BTConfig.presenceAwayTimer = PresenceAwayTimer;
+  BTConfig.movingTimer = MovingTimer;
 }
 
-// Watchdog, if there was no change of btQueueLengthSum for 5 minutes, restart ESP
+// Watchdog, if there was no change of BLE scanCount, restart BT
 void btScanWDG() {
-  static unsigned long previousbtQueueLengthSum = 0;
-  static unsigned long lastBtMsgTime = 0;
+  static unsigned long previousBtScanCount = 0;
+  static unsigned long lastBtScan = 0;
   unsigned long now = millis();
   if (!ProcessLock &&
-      previousbtQueueLengthSum == btQueueLengthSum &&
-      btQueueLengthSum != 0 &&
-      (now - lastBtMsgTime > BTConfig.BLEinterval)) {
-    Log.error(F("BLE Scan watchdog triggered at : %ds" CR), lastBtMsgTime / 1000);
-    ESPRestart();
+      previousBtScanCount == scanCount &&
+      scanCount != 0 &&
+      (now - lastBtScan > BTConfig.BLEinterval)) {
+    Log.error(F("BLE Scan watchdog triggered at : %ds" CR), lastBtScan / 1000);
+    stopProcessing();
+    startProcessing();
   } else {
-    previousbtQueueLengthSum = btQueueLengthSum;
-    lastBtMsgTime = now;
+    previousBtScanCount = scanCount;
+    lastBtScan = now;
   }
 }
 
@@ -143,10 +150,14 @@ String stateBTMeasures(bool start) {
   jo["pubBeaconUuidForTopic"] = BTConfig.pubBeaconUuidForTopic;
   jo["ignoreWBlist"] = BTConfig.ignoreWBlist;
   jo["presenceawaytimer"] = BTConfig.presenceAwayTimer;
+  jo["movingtimer"] = BTConfig.movingTimer;
   jo["btqblck"] = btQueueBlocked;
   jo["btqsum"] = btQueueLengthSum;
   jo["btqsnd"] = btQueueLengthCount;
   jo["btqavg"] = (btQueueLengthCount > 0 ? btQueueLengthSum / (float)btQueueLengthCount : 0);
+  jo["bletaskstack"] = uxTaskGetStackHighWaterMark(xProcBLETaskHandle);
+  jo["blecoretaskstack"] = uxTaskGetStackHighWaterMark(xCoreTaskHandle);
+  jo["blestarts"] = BLEstarts;
 
   if (start) {
     Log.notice(F("BT sys: "));
@@ -218,6 +229,8 @@ void BTConfig_fromJson(JsonObject& BTdata, bool startup = false) {
   Config_update(BTdata, "presenceUseBeaconUuid", BTConfig.presenceUseBeaconUuid);
   // Timer to trigger a device state as offline if not seen
   Config_update(BTdata, "presenceawaytimer", BTConfig.presenceAwayTimer);
+  // Timer to trigger a device state as offline if not seen
+  Config_update(BTdata, "movingtimer", BTConfig.movingTimer);
   // MinRSSI set
   Config_update(BTdata, "minrssi", BTConfig.minRssi);
   // Send undecoded device data
@@ -239,10 +252,13 @@ void BTConfig_fromJson(JsonObject& BTdata, bool startup = false) {
     // Erase config from NVS (non-volatile storage)
     preferences.begin(Gateway_Short_Name, false);
     if (preferences.isKey("BTConfig")) {
-      preferences.remove("BTConfig");
+      int result = preferences.remove("BTConfig");
+      Log.notice(F("BT config erase result: %d" CR), result);
       preferences.end();
-      Log.notice(F("BT config erased" CR));
       return; // Erase prevails on save, so skipping save
+    } else {
+      preferences.end();
+      Log.notice(F("BT config not found" CR));
     }
   }
 
@@ -268,13 +284,14 @@ void BTConfig_fromJson(JsonObject& BTdata, bool startup = false) {
     jo["pubBeaconUuidForTopic"] = BTConfig.pubBeaconUuidForTopic;
     jo["ignoreWBlist"] = BTConfig.ignoreWBlist;
     jo["presenceawaytimer"] = BTConfig.presenceAwayTimer;
+    jo["movingtimer"] = BTConfig.movingTimer;
     // Save config into NVS (non-volatile storage)
     String conf = "";
     serializeJson(jsonBuffer, conf);
     preferences.begin(Gateway_Short_Name, false);
-    preferences.putString("BTConfig", conf);
+    int result = preferences.putString("BTConfig", conf);
     preferences.end();
-    Log.notice(F("BT config saved" CR));
+    Log.notice(F("BT config save: %s, result: %d" CR), conf.c_str(), result);
   }
 }
 
@@ -296,6 +313,9 @@ void BTConfig_load() {
     JsonObject jo = jsonBuffer.as<JsonObject>();
     BTConfig_fromJson(jo, true); // Never send MQTT message with config
     Log.notice(F("BT config loaded" CR));
+  } else {
+    preferences.end();
+    Log.notice(F("BT config not found" CR));
   }
 }
 
@@ -346,10 +366,7 @@ public:
   }
 };
 
-void PublishDeviceData(JsonObject& BLEdata, bool processBLEData = true);
-
-static TaskHandle_t xCoreTaskHandle;
-static TaskHandle_t xProcBLETaskHandle;
+void PublishDeviceData(JsonObject& BLEdata);
 
 atomic_int forceBTScan;
 
@@ -484,15 +501,28 @@ void updateDevicesStatus() {
   for (vector<BLEdevice*>::iterator it = devices.begin(); it != devices.end(); ++it) {
     BLEdevice* p = *it;
     unsigned long now = millis();
-    if (p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::NUT ||
-        p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::MIBAND ||
-        p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::TAGIT ||
-        p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::TILE ||
-        p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::TILEN ||
-        p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::ITAG ||
-        p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::RUUVITAG_RAWV1 ||
-        p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::RUUVITAG_RAWV2) { // We apply the offline status only for tracking device, can be extended further to all the devices
+    // Device tracker devices
+    if (BTConfig.presenceEnable && (p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::NUT ||
+                                    p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::MIBAND ||
+                                    p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::TAGIT ||
+                                    p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::TILE ||
+                                    p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::TILEN ||
+                                    p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::ITAG ||
+                                    p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::RUUVITAG_RAWV1 ||
+                                    p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::RUUVITAG_RAWV2)) { // We apply the offline status only for tracking device, can be extended further to all the devices
       if ((p->lastUpdate != 0) && (p->lastUpdate < (now - BTConfig.presenceAwayTimer) && (now > BTConfig.presenceAwayTimer)) &&
+          (BTConfig.ignoreWBlist || ((!oneWhite || isWhite(p)) && !isBlack(p)))) { // Only if WBlist is disabled OR ((no white MAC OR this MAC is white) AND not a black listed MAC)) {
+        JsonObject BLEdata = getBTJsonObject();
+        BLEdata["id"] = p->macAdr;
+        BLEdata["state"] = "offline";
+        pubBT(BLEdata);
+        // We set the lastUpdate to 0 to avoid replublishing the offline state
+        p->lastUpdate = 0;
+      }
+    }
+    // Moving detection devices (devices with an accelerometer)
+    if (p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::BC08) {
+      if ((p->lastUpdate != 0) && (p->lastUpdate < (now - BTConfig.movingTimer) && (now > BTConfig.movingTimer)) &&
           (BTConfig.ignoreWBlist || ((!oneWhite || isWhite(p)) && !isBlack(p)))) { // Only if WBlist is disabled OR ((no white MAC OR this MAC is white) AND not a black listed MAC)) {
         JsonObject BLEdata = getBTJsonObject();
         BLEdata["id"] = p->macAdr;
@@ -646,7 +676,7 @@ std::string convertServiceData(std::string deviceServiceData) {
   char spr[2 * serviceDataLength + 1];
   for (int i = 0; i < serviceDataLength; i++) sprintf(spr + 2 * i, "%.2x", (unsigned char)deviceServiceData[i]);
   spr[2 * serviceDataLength] = 0;
-  Log.trace("Converted service data (%d) to %s" CR, serviceDataLength, spr);
+  Log.trace(F("Converted service data (%d) to %s" CR), serviceDataLength, spr);
   return spr;
 }
 
@@ -702,22 +732,38 @@ void procBLETask(void* pvParameters) {
           for (int j = 0; j < serviceDataCount; j++) {
             std::string service_data = convertServiceData(advertisedDevice->getServiceData(j));
             Log.trace(F("Service data: %s" CR), service_data.c_str());
-            BLEdata["servicedata"] = (char*)service_data.c_str();
             std::string serviceDatauuid = advertisedDevice->getServiceDataUUID(j).toString();
             Log.trace(F("Service data UUID: %s" CR), (char*)serviceDatauuid.c_str());
-            BLEdata["servicedatauuid"] = (char*)serviceDatauuid.c_str();
-            process_bledata(BLEdata); // this will force to resolve all the service data
+            if (j) {
+              // if we have more than one service data, we need to create a new BLEdata object to publish the data to MQTT
+              // we can't use the same BLEdata object because its servicedata would be overwritten by the next service data
+              // the decoder does not handle multiple servicedata in the same message
+              // note that we keep the decoded data during the different iterations of the loop,
+              // the goal is to avoid issue with certain controllers that do not handle multiple messages with undecoded data (OpenHAB for example)
+              JsonObject& BLEdataTemp = getBTJsonObject();
+              bool ret = BLEdataTemp.set(BLEdata);
+              if (!ret) {
+                Log.error(F("BLEdataTemp.set(BLEdata) failed" CR));
+              } else {
+                BLEdataTemp.remove("servicedata");
+                BLEdataTemp["servicedata"] = (char*)service_data.c_str();
+                BLEdataTemp.remove("servicedatauuid");
+                BLEdataTemp["servicedatauuid"] = (char*)serviceDatauuid.c_str();
+                PublishDeviceData(BLEdataTemp);
+              }
+            } else {
+              BLEdata["servicedata"] = (char*)service_data.c_str();
+              BLEdata["servicedatauuid"] = (char*)serviceDatauuid.c_str();
+              PublishDeviceData(BLEdata);
+            }
           }
-
-          PublishDeviceData(BLEdata, false);
         } else {
-          PublishDeviceData(BLEdata); // PublishDeviceData has its own logic whether it needs to publish the json or not
+          PublishDeviceData(BLEdata);
         }
       } else {
         Log.trace(F("Filtered MAC device" CR));
       }
-      if (BTConfig.presenceEnable)
-        updateDevicesStatus();
+      updateDevicesStatus();
     }
     delete (advertisedDevice);
   }
@@ -735,7 +781,7 @@ void BLEscan() {
   BLEScan* pBLEScan = BLEDevice::getScan();
   MyAdvertisedDeviceCallbacks myCallbacks;
   pBLEScan->setAdvertisedDeviceCallbacks(&myCallbacks);
-  if (millis() > (timeBetweenActive + BTConfig.intervalActiveScan)) {
+  if (millis() > (timeBetweenActive + BTConfig.intervalActiveScan) || BTConfig.intervalActiveScan == BTConfig.BLEinterval) {
     pBLEScan->setActiveScan(true);
     timeBetweenActive = millis();
   } else {
@@ -744,7 +790,8 @@ void BLEscan() {
   pBLEScan->setInterval(BLEScanInterval);
   pBLEScan->setWindow(BLEScanWindow);
   BLEScanResults foundDevices = pBLEScan->start(BTConfig.scanDuration / 1000, false);
-  scanCount++;
+  if (foundDevices.getCount())
+    scanCount++;
   Log.notice(F("Found %d devices, scan number %d end" CR), foundDevices.getCount(), scanCount);
   Log.trace(F("Process BLE stack free: %u" CR), uxTaskGetStackHighWaterMark(xProcBLETaskHandle));
 }
@@ -820,14 +867,21 @@ void BLEconnect() {
 }
 
 void stopProcessing() {
-  Log.notice(F("Stop BLE processing" CR));
   ProcessLock = true;
   delay(BTConfig.scanDuration < 2000 ? BTConfig.scanDuration : 2000);
-  //Suspending and deleting tasks to free memory for OTA operations
+  //Suspending, deleting tasks and stopping BT to free memory
   vTaskSuspend(xCoreTaskHandle);
   vTaskDelete(xCoreTaskHandle);
   vTaskSuspend(xProcBLETaskHandle);
   vTaskDelete(xProcBLETaskHandle);
+  if (BLEDevice::getInitialized()) BLEDevice::deinit(true);
+  Log.notice(F("BLE gateway stopped, free heap: %d" CR), ESP.getFreeHeap());
+}
+
+void startProcessing() {
+  ProcessLock = false;
+  setupBTTasksAndBLE();
+  Log.notice(F("BLE gateway started, free heap: %d" CR), ESP.getFreeHeap());
 }
 
 void coreTask(void* pvParameters) {
@@ -885,8 +939,7 @@ void deepSleep(uint64_t time_in_us) {
 #    endif
 
   Log.trace(F("Deactivating ESP32 components" CR));
-  if (BLEDevice::getInitialized()) BLEDevice::deinit(true);
-  esp_bt_mem_release(ESP_BT_MODE_BTDM);
+  stopProcessing();
   // Ignore the deprecated warning, this call is necessary here.
 #    pragma GCC diagnostic push
 #    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -918,39 +971,15 @@ void changelowpowermode(int newLowPowerMode) {
 #    endif
   lowpowermode = newLowPowerMode;
   preferences.begin(Gateway_Short_Name, false);
-  preferences.putUInt("lowpowermode", lowpowermode);
+  int result = preferences.putUInt("lowpowermode", lowpowermode);
+  Log.notice(F("BT LPM config save result: %d" CR), result);
   preferences.end();
   // Publish the states to update the controller switch status
   stateMeasures();
 #  endif
 }
 
-void setupBT() {
-  BTConfig_init();
-  BTConfig_load();
-  Log.notice(F("BLE scans interval: %d" CR), BTConfig.BLEinterval);
-  Log.notice(F("BLE connects interval: %d" CR), BTConfig.intervalConnect);
-  Log.notice(F("BLE scan duration: %d" CR), BTConfig.scanDuration);
-  Log.notice(F("Publishing only BLE sensors: %T" CR), BTConfig.pubOnlySensors);
-  Log.notice(F("Publishing random MAC devices: %T" CR), BTConfig.pubRandomMACs);
-  Log.notice(F("Adaptive BLE scan: %T" CR), BTConfig.adaptiveScan);
-  Log.notice(F("Active BLE scan interval: %d" CR), BTConfig.intervalActiveScan);
-  Log.notice(F("minrssi: %d" CR), -abs(BTConfig.minRssi));
-  Log.notice(F("Low Power Mode: %d" CR), lowpowermode);
-  Log.notice(F("Presence Away Timer: %d" CR), BTConfig.presenceAwayTimer);
-
-  atomic_init(&forceBTScan, 0); // in theory, we don't need this
-  atomic_init(&jsonBTBufferQueueNext, 0); // in theory, we don't need this
-  atomic_init(&jsonBTBufferQueueLast, 0); // in theory, we don't need this
-
-  semaphoreCreateOrUpdateDevice = xSemaphoreCreateBinary();
-  xSemaphoreGive(semaphoreCreateOrUpdateDevice);
-
-  semaphoreBLEOperation = xSemaphoreCreateBinary();
-  xSemaphoreGive(semaphoreBLEOperation);
-
-  BLEQueue = xQueueCreate(32, sizeof(NimBLEAdvertisedDevice*));
-
+void setupBTTasksAndBLE() {
   BLEDevice::setScanDuplicateCacheSize(BLEScanDuplicateCacheSize);
   BLEDevice::init("");
 
@@ -967,11 +996,44 @@ void setupBT() {
   xTaskCreatePinnedToCore(
       coreTask, /* Function to implement the task */
       "coreTask", /* Name of the task */
-      10000, /* Stack size in bytes */
+      5120, /* Stack size in bytes */
       NULL, /* Task input parameter */
       1, /* Priority of the task */
       &xCoreTaskHandle, /* Task handle. */
       taskCore); /* Core where the task should run */
+
+  BLEstarts++;
+}
+
+void setupBT() {
+  BTConfig_init();
+  BTConfig_load();
+  Log.notice(F("BLE scans interval: %d" CR), BTConfig.BLEinterval);
+  Log.notice(F("BLE connects interval: %d" CR), BTConfig.intervalConnect);
+  Log.notice(F("BLE scan duration: %d" CR), BTConfig.scanDuration);
+  Log.notice(F("Publishing only BLE sensors: %T" CR), BTConfig.pubOnlySensors);
+  Log.notice(F("Publishing random MAC devices: %T" CR), BTConfig.pubRandomMACs);
+  Log.notice(F("Adaptive BLE scan: %T" CR), BTConfig.adaptiveScan);
+  Log.notice(F("Active BLE scan interval: %d" CR), BTConfig.intervalActiveScan);
+  Log.notice(F("minrssi: %d" CR), -abs(BTConfig.minRssi));
+  Log.notice(F("Low Power Mode: %d" CR), lowpowermode);
+  Log.notice(F("Presence Away Timer: %d" CR), BTConfig.presenceAwayTimer);
+  Log.notice(F("Moving Timer: %d" CR), BTConfig.movingTimer);
+
+  atomic_init(&forceBTScan, 0); // in theory, we don't need this
+  atomic_init(&jsonBTBufferQueueNext, 0); // in theory, we don't need this
+  atomic_init(&jsonBTBufferQueueLast, 0); // in theory, we don't need this
+
+  semaphoreCreateOrUpdateDevice = xSemaphoreCreateBinary();
+  xSemaphoreGive(semaphoreCreateOrUpdateDevice);
+
+  semaphoreBLEOperation = xSemaphoreCreateBinary();
+  xSemaphoreGive(semaphoreBLEOperation);
+
+  BLEQueue = xQueueCreate(32, sizeof(NimBLEAdvertisedDevice*));
+
+  setupBTTasksAndBLE();
+
   Log.trace(F("ZgatewayBT multicore ESP32 setup done " CR));
 }
 
@@ -1037,20 +1099,27 @@ void launchBTDiscovery(bool overrideDiscovery) {
                           model.c_str(), brand.c_str(), model_id.c_str(), macWOdots.c_str(), false,
                           stateClassNone);
         }
+        if (p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::BC08) {
+          String sensor_name = String(model_id.c_str()) + "-moving";
+          String sensor_id = macWOdots + "-moving";
+          createDiscovery("binary_sensor",
+                          discovery_topic.c_str(), sensor_name.c_str(), sensor_id.c_str(),
+                          will_Topic, "moving", "{% if value_json.get('accx') -%}on{%- else -%}off{%- endif %}",
+                          "on", "off", "",
+                          0, "", "", false, "",
+                          model.c_str(), brand.c_str(), model_id.c_str(), macWOdots.c_str(), false,
+                          stateClassNone);
+        }
         if (!properties.empty()) {
           StaticJsonDocument<JSON_MSG_BUFFER> jsonBuffer;
           deserializeJson(jsonBuffer, properties);
           for (JsonPair prop : jsonBuffer["properties"].as<JsonObject>()) {
-            Log.trace("Key: %s", prop.key().c_str());
-            Log.trace("Unit: %s", prop.value()["unit"].as<const char*>());
-            Log.trace("Name: %s", prop.value()["name"].as<const char*>());
+            Log.trace(F("Key: %s"), prop.key().c_str());
+            Log.trace(F("Unit: %s"), prop.value()["unit"].as<const char*>());
+            Log.trace(F("Name: %s"), prop.value()["name"].as<const char*>());
             String entity_name = String(model_id.c_str()) + "-" + String(prop.key().c_str());
             String unique_id = macWOdots + "-" + String(prop.key().c_str());
-#    if OpenHABDiscovery
-            String value_template = "{{ value_json." + String(prop.key().c_str()) + "}}";
-#    else
             String value_template = "{{ value_json." + String(prop.key().c_str()) + " | is_defined }}";
-#    endif
             if (p->sensorModel_id == TheengsDecoder::BLE_ID_NUM::SBS1 && strcmp(prop.key().c_str(), "state") != 0) {
               String payload_on = "{\"SBS1\":\"on\",\"mac\":\"" + String(p->macAdr) + "\"}";
               String payload_off = "{\"SBS1\":\"off\",\"mac\":\"" + String(p->macAdr) + "\"}";
@@ -1107,9 +1176,13 @@ void launchBTDiscovery(bool overrideDiscovery) {
 }
 #  endif
 
-void PublishDeviceData(JsonObject& BLEdata, bool processBLEData) {
+void PublishDeviceData(JsonObject& BLEdata) {
   if (abs((int)BLEdata["rssi"] | 0) < abs(BTConfig.minRssi)) { // process only the devices close enough
-    if (processBLEData) process_bledata(BLEdata);
+    // If the BLEdata contains already decoded data from a previous servicedata iteration, the following one is not decoded and pubAdvData is false we don't publish this duplicate payload
+    if (process_bledata(BLEdata) < 0 && BLEdata.containsKey("model_id") && !BTConfig.pubAdvData) {
+      return;
+    }
+    // If the device is a random MAC and pubRandomMACs is false we don't publish this payload
     if (!BTConfig.pubRandomMACs && (BLEdata["type"].as<string>()).compare("RMAC") == 0) {
       return;
     }
@@ -1136,7 +1209,7 @@ void PublishDeviceData(JsonObject& BLEdata, bool processBLEData) {
   }
 }
 
-void process_bledata(JsonObject& BLEdata) {
+int process_bledata(JsonObject& BLEdata) {
   const char* mac = BLEdata["id"].as<const char*>();
   int model_id = BTConfig.extDecoderEnable ? -1 : decoder.decodeBLEJson(BLEdata);
   int mac_type = BLEdata["mac_type"].as<int>();
@@ -1200,6 +1273,7 @@ void process_bledata(JsonObject& BLEdata) {
   if (!BTConfig.extDecoderEnable && model_id < 0) {
     Log.trace(F("No eligible device found " CR));
   }
+  return model_id;
 }
 
 void hass_presence(JsonObject& HomePresence) {
