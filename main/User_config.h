@@ -668,7 +668,7 @@ Adafruit_NeoPixel leds2(ANEOPIX_IND_NUM_LEDS, ANEOPIX_IND_DATA_GPIO2, ANEOPIX_IN
 #define subjectMQTTtoX     "/commands/#"
 #define subjectMultiGTWKey "toMQTT"
 #define subjectGTWSendKey  "MQTTto"
-
+#define Pilight_rawEnabled true   // enables Pilight RAW return - switchable via MQTT
 // key used for launching commands to the gateway
 #define restartCmd "restart"
 #define eraseCmd   "erase"
